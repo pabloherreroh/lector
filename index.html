@@ -454,7 +454,14 @@ function wavBlob(chunks, total, sr){
   }
   return new Blob([buf], { type:'audio/wav' });
 }
-let silentURL = null;
+let silentURL = null, keepURL = null;
+/* 10 s de silencio casi total (ruido inaudible) para mantener viva la sesión multimedia */
+const KEEPALIVE = () => {
+  if(keepURL) return keepURL;
+  const n = 8000 * 10, x = new Float32Array(n);
+  for(let i = 0; i < n; i++) x[i] = (Math.random() < 0.5 ? -1 : 1) / 32768;
+  return (keepURL = URL.createObjectURL(wavBlob([x], n, 8000)));
+};
 const SILENT = () => silentURL || (silentURL = URL.createObjectURL(wavBlob([11025], 11025, 22050)));
 
 function friendly(msg){
@@ -532,18 +539,17 @@ const Natural = {
   },
   prepare(){ return this.send({ type:'prepare', voice:this.voice(), gen:0 }); },
 
-  /* Salida de audio: un único flujo continuo (AudioContext conectado a un <audio>).
-     Para el sistema es una sola pista que no se reinicia entre frases, y sigue
-     sonando con el móvil bloqueado. */
+  /* Salida de audio: las frases se encadenan en un AudioContext que suena directamente
+     por el altavoz, sin cortes. Un <audio> en bucle casi silencioso mantiene la sesión
+     multimedia: controles en la pantalla de bloqueo y lectura con el móvil bloqueado. */
   output(){
     if(!this.ctx){
       const AC = window.AudioContext || window.webkitAudioContext;
       this.ctx = new AC({ latencyHint:'playback' });
       this.gain = this.ctx.createGain();
-      const dest = this.ctx.createMediaStreamDestination();
-      this.gain.connect(dest);
+      this.gain.connect(this.ctx.destination);
       const a = this.a = $('#audio');
-      a.srcObject = dest.stream;
+      a.loop = true; a.src = KEEPALIVE();
       a.addEventListener('pause', () => {
         // Pausa externa (auriculares desconectados, llamada, otra app)
         if(Date.now() - this.internalAt < 800 || !R.playing || S.engine !== 'natural') return;
@@ -555,7 +561,7 @@ const Natural = {
     this.internalAt = Date.now();
     this.a.play().catch(() => {});
   },
-  lat(){ return (this.ctx.outputLatency || this.ctx.baseLatency || 0) + 0.12; },
+  lat(){ return (this.ctx.outputLatency || this.ctx.baseLatency || 0) + 0.04; },
   start(from, h){
     this.stop();
     const gen = this.gen; this.h = h; this.next = from; this.made = 0; this.queue = [];
@@ -652,6 +658,7 @@ const Natural = {
     const e = this.tl[0];
     if(t < e.t0 - 0.02) return;
     if(e.i !== this.lastI){ this.lastI = e.i; this.lastW = -1; this.h.onSentence(e.i); }
+    if(document.hidden) return; // con la pantalla apagada no hace falta mover el subrayado
     let w = 0; while(w + 1 < e.words.length && t >= e.t0 + e.words[w + 1]) w++;
     if(w !== this.lastW){ this.lastW = w; this.h.onWord(e.i, w); }
   },
