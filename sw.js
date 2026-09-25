@@ -1,5 +1,5 @@
 /* Service worker de Lector: permite instalar la app y abrirla sin conexión. */
-const VERSION = 'lector-app-v1';
+const VERSION = 'lector-app-v4';
 const SHELL = ['./', './index.html', './manifest.json', './icon-192.png', './icon-512.png', './icon-maskable-512.png'];
 const CDN = /^https:\/\/(cdnjs\.cloudflare\.com|cdn\.jsdelivr\.net|fonts\.googleapis\.com|fonts\.gstatic\.com)\//;
 
