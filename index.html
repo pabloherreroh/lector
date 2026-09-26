@@ -217,6 +217,7 @@ dialog.sheet::backdrop{background:rgba(8,12,20,.45)}
     </div>
   </div>
   <button class="btn primary" style="width:100%" data-close>Listo</button>
+  <p class="hint" style="text-align:center;margin-top:12px">Versión 7</p>
 </dialog>
 
 <!-- PEGAR TEXTO -->
@@ -348,7 +349,8 @@ function workerMain(){
   function loadLibs(){
     if(libs) return;
     importScripts(ORT + 'ort.wasm.min.js', PH + '.js');
-    ort.env.wasm.wasmPaths = ORT; ort.env.wasm.numThreads = 1; ort.env.wasm.proxy = false;
+    ort.env.wasm.wasmPaths = ORT; ort.env.wasm.proxy = false;
+    ort.env.wasm.numThreads = self.crossOriginIsolated ? Math.max(1, Math.min(4, (navigator.hardwareConcurrency || 2) - 1)) : 1;
     libs = true;
   }
   async function fetchCached(key, urls, label, id){
@@ -408,7 +410,8 @@ function workerMain(){
     const sid = cfg.num_speakers > 1 ? ((cfg.speaker_id_map || {})[job.voice.speaker] ?? 0) : null;
     const pcm = [];
     for(const r of ph){
-      if(job.gen < minGen) return null;
+      await yieldNow();
+      if(job.gen && job.gen < minGen) return null;
       if(!r.phonemes || !r.phonemes.length || !r.phoneme_ids || !r.phoneme_ids.length){ pcm.push(new Float32Array(0)); continue; }
       const ids = BigInt64Array.from(r.phoneme_ids, v => BigInt(v));
       const feeds = {
@@ -422,23 +425,26 @@ function workerMain(){
     }
     return { pcm, sr:cfg.audio.sample_rate, phon:ph.map(x => x.phonemes || []) };
   }
+  /* Cede el turno para que lleguen los mensajes nuevos (pausa, salto) aunque haya trabajo en cola */
+  const yieldNow = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
   async function pump(){
     if(busy) return; busy = true;
     while(jobs.length){
+      await yieldNow();
       const job = jobs.shift();
-      if(job.type === 'synth' && job.gen < minGen) continue;
+      if(job.type === 'synth' && job.gen && job.gen < minGen){ post({ type:'dropped', id:job.id }); continue; }
       try{
-        if(job.type === 'prepare'){ await ensure(job.voice, job.id); post({ type:'ready', id:job.id }); }
+        if(job.type === 'prepare'){ await ensure(job.voice, job.id); post({ type:'ready', id:job.id, voiceId:job.voice.id }); }
         else{
           const r = await synth(job);
-          if(r) post({ type:'audio', id:job.id, pcm:r.pcm, sr:r.sr, phon:r.phon }, r.pcm.map(a => a.buffer));
+          if(r) post({ type:'audio', id:job.id, voiceId:job.voice.id, pcm:r.pcm, sr:r.sr, phon:r.phon }, r.pcm.map(a => a.buffer));
           else post({ type:'dropped', id:job.id });
         }
       }catch(e){ post({ type:'error', id:job.id, message:String((e && e.message) || e) }); }
     }
     busy = false;
   }
-  self.onmessage = e => { const m = e.data; if(m.type === 'cancel'){ minGen = m.gen; return; } jobs.push(m); pump(); };
+  self.onmessage = e => { const m = e.data; if(m.type === 'cancel'){ minGen = m.gen; return; } if(m.prio){ const k = jobs.findIndex(j => !j.prio); if(k >= 0) jobs.splice(k, 0, m); else jobs.push(m); } else jobs.push(m); pump(); };
 }
 
 function wavBlob(chunks, total, sr){
@@ -480,11 +486,12 @@ function splitText(text, max){
   while(text.length - s > max){
     const chunk = text.slice(s, s + max + 1);
     let cut = -1; const re = /[,;:)](?=\s)/g; let m;
-    while((m = re.exec(chunk))){ if(m.index >= 25) cut = m.index + 1; }
-    if(cut < 0){ const k = chunk.lastIndexOf(' '); if(k > 20) cut = k; }
+    const minCut = Math.max(8, Math.floor(max * 0.4));
+    while((m = re.exec(chunk))){ if(m.index >= minCut) cut = m.index + 1; }
+    if(cut < 0){ const k = chunk.lastIndexOf(' '); if(k > minCut) cut = k; }
     if(cut < 0) break;
     let n = s + cut; while(n < text.length && /\s/.test(text[n])) n++;
-    if(text.length - n < 12) break;
+    if(text.length - n < Math.min(12, max / 2)) break;
     out.push({ s, e:n }); s = n;
   }
   out.push({ s, e:text.length });
@@ -520,32 +527,72 @@ function wordTimes(text, phon, pc, sr){
 
 const Natural = {
   id:'natural', name:'Voz natural',
-  w:null, seq:0, pending:new Map(), gen:1, queue:[], carry:[], next:0, made:0, resumeChk:null, h:null, a:null, internalAt:0,
+  seq:0, pending:new Map(), gen:1, queue:[], carry:[], next:0, made:0, resumeChk:null, h:null, a:null, internalAt:0,
   ctx:null, gain:null, srcs:[], tl:[], endTime:0, lastI:-1, lastW:-1, paused:false, ticker:null,
   available(){ return 'Worker' in window && 'caches' in window && window.isSecureContext && typeof BigInt64Array !== 'undefined' && !!(window.AudioContext || window.webkitAudioContext); },
   voice(){ const all = allVoices(); return all.find(v => v.id === S.naturalVoice) || all[0]; },
-  worker(){
-    if(this.w) return this.w;
+  /* Varios "motores" en paralelo: mientras uno genera un trozo, otro prepara el siguiente.
+     Así la voz va por delante de la lectura aunque el móvil no sea muy rápido. */
+  ws:[], load:[], wready:[], jobK:new Map(), readyVoice:null,
+  poolSize(){
+    if(this.readyVoice !== this.voice().id) return 1;  // hasta tener la voz guardada, un solo motor
+    const hc = navigator.hardwareConcurrency || 2, mem = navigator.deviceMemory || 4;
+    return hc >= 8 && mem >= 6 ? 3 : hc >= 4 && mem >= 3 ? 2 : 1;
+  },
+  worker(k){
+    if(this.ws[k]) return this.ws[k];
     const url = URL.createObjectURL(new Blob(['(' + workerMain.toString() + ')()'], { type:'text/javascript' }));
-    this.w = new Worker(url);
-    this.w.onmessage = e => this.onMsg(e.data);
-    this.w.onerror = e => {
+    const w = this.ws[k] = new Worker(url);
+    this.load[k] = 0;
+    w.onmessage = e => this.onMsg(e.data);
+    w.onerror = e => {
       const err = { error:friendly(e && e.message) };
-      this.pending.forEach(p => p.resolve(err)); this.pending.clear();
-      this.w = null;
+      this.jobK.forEach((kk, id) => { if(kk === k){ const p = this.pending.get(id); if(p){ p.resolve(err); this.pending.delete(id); } this.jobK.delete(id); } });
+      this.ws[k] = null; this.load[k] = 0;
     };
-    return this.w;
+    return w;
+  },
+  get w(){ return this.ws[0] || null; },
+  /* Carga la voz en los motores extra con antelación para que estén listos cuando hagan falta */
+  spinUp(){
+    const n = this.poolSize(), v = this.voice();
+    for(let k = 1; k < n; k++){
+      const id = ++this.seq;
+      this.worker(k).postMessage({ type:'prepare', voice:v, gen:0, id });
+      this.load[k] = (this.load[k] || 0) + 1; this.jobK.set(id, k);
+    }
   },
   send(msg){
     const id = ++this.seq;
+    let k = 0;
+    if(msg.type === 'synth'){
+      // Solo se usan los motores que ya tienen la voz cargada (el 0 siempre)
+      const n = this.poolSize(), fast = n - 1, L = j => this.load[j] || 0, ok = j => j === 0 || this.wready[j] === msg.voice.id;
+      if(n > 1 && ok(fast) && msg.prio) k = fast;
+      else {
+        // Con 2 motores se reparten todo; con 3, el último se reserva para arranques y trozos cortos
+        const last = n >= 3 ? n - 1 : n;
+        for(let j = 1; j < last; j++) if(ok(j) && L(j) < L(k)) k = j;
+        if(n >= 3 && ok(fast) && L(fast) === 0 && msg.texts[0].length <= 35) k = fast;
+      }
+    }
     return new Promise(resolve => {
       this.pending.set(id, { resolve, gen:msg.gen });
-      try{ this.worker().postMessage(Object.assign({}, msg, { id })); }
-      catch(e){ this.pending.delete(id); resolve({ error:friendly(e && e.message) }); }
+      try{
+        this.worker(k).postMessage(Object.assign({}, msg, { id }));
+        this.load[k] = (this.load[k] || 0) + 1; this.jobK.set(id, k);
+      }catch(e){ this.pending.delete(id); resolve({ error:friendly(e && e.message) }); }
     });
   },
   onMsg(m){
     if(m.type === 'progress'){ onVoiceProgress(m); return; }
+    if(this.jobK.has(m.id)){
+      const k = this.jobK.get(m.id); this.load[k] = Math.max(0, (this.load[k] || 0) - 1); this.jobK.delete(m.id);
+      if((m.type === 'ready' || m.type === 'audio') && m.voiceId) this.wready[k] = m.voiceId;
+    }
+    if((m.type === 'audio' || m.type === 'ready') && m.voiceId && this.readyVoice !== m.voiceId){
+      this.readyVoice = m.voiceId; this.spinUp();
+    }
     const p = this.pending.get(m.id); if(!p) return;
     this.pending.delete(m.id);
     if(m.type === 'audio') p.resolve({ pcm:m.pcm, sr:m.sr, phon:m.phon });
@@ -596,29 +643,73 @@ const Natural = {
   /* Trozos de síntesis: las frases largas se parten por comas para que el primer audio
      llegue antes y los saltos respondan rápido. La primera pieza tras pulsar reproducir
      es corta a propósito. */
-  unitsOf(i, fast){
+  unitsOf(i){
     const text = R.flat[i];
-    let parts = splitText(text, 220);
-    if(fast && parts[0].text.length > 90 && !this.cache.has(this.ckey(parts[0].text))){
-      const sub = splitText(parts[0].text, 70).map(p => ({ text:p.text, s:parts[0].s + p.s }));
-      parts = sub.concat(parts.slice(1));
-    }
+    const parts = splitText(text, 100);
     return parts.map((p, k) => ({ i, text:p.text, wOff:tokens(text.slice(0, p.s)).length, first:k === 0, last:k === parts.length - 1 }));
+  },
+  cursor(from){
+    const self = this;
+    return {
+      carry:[], next:from, maxLen:18,
+      take(){
+        if(!this.carry.length){
+          if(this.next >= R.flat.length) return null;
+          this.carry = self.unitsOf(this.next++);
+        }
+        let u = this.carry.shift();
+        if(u.text.length > this.maxLen * 1.3 && !self.cache.has(self.ckey(u.text))){
+          const parts = splitText(u.text, this.maxLen);
+          const pieces = parts.map((p, k) => ({ i:u.i, text:p.text, wOff:u.wOff + tokens(u.text.slice(0, p.s)).length,
+            first:u.first && k === 0, last:u.last && k === parts.length - 1 }));
+          u = pieces.shift(); this.carry = pieces.concat(this.carry);
+        }
+        this.maxLen = Math.min(100, Math.round(this.maxLen * 1.35));
+        return u;
+      },
+      get done(){ return !this.carry.length && this.next >= R.flat.length; }
+    };
+  },
+  /* Genera (o reutiliza) el audio de un trozo. Comparte el trabajo si ya se está generando. */
+  inflight:new Map(),
+  audioFor(text, gen, prio){
+    const key = this.ckey(text);
+    const hit = this.cget(key);
+    if(hit) return Promise.resolve(hit);
+    const fl = this.inflight.get(key);
+    if(fl && (fl.gen === 0 || fl.gen === this.gen)) return fl.p;
+    const p = this.send({ type:'synth', gen, voice:this.voice(), texts:[text], rate:S.rate, prio:!!prio }).then(r => {
+      if(this.inflight.get(key) === entry) this.inflight.delete(key);
+      if(r.dropped || r.error) return r;
+      const v = { pcm:r.pcm[0], sr:r.sr, phon:r.phon && r.phon[0] };
+      this.cput(key, v); return v;
+    });
+    const entry = { p, gen };
+    this.inflight.set(key, entry);
+    return p;
+  },
+  /* Prepara en segundo plano el comienzo de una frase para que al pulsar reproducir suene al instante */
+  async warm(i){
+    if(!this.available() || S.engine !== 'natural' || !R.flat[i]) return;
+    if(!this.w && !(await this.isStored())) return;
+    const c = this.cursor(i);
+    for(let k = 0; k < 6; k++){ const u = c.take(); if(u) this.audioFor(u.text, 0, k < 2); }
   },
   start(from, h){
     this.stop();
     const gen = this.gen; this.h = h; this.made = 0; this.queue = [];
-    this.carry = this.unitsOf(from, true); this.next = from + 1;
+    this.cur = this.cursor(from); this.firsts = 2;
     this.output();
     this.endTime = this.ctx.currentTime + 0.05;
     this.fill(gen); this.pump(gen); this.runTicker();
   },
   stop(){
     this.gen++; this.paused = false; clearInterval(this.resumeChk);
-    if(this.w) this.w.postMessage({ type:'cancel', gen:this.gen });
+    this.ws.forEach(w => { if(w) w.postMessage({ type:'cancel', gen:this.gen }); });
     this.pending.forEach((p, id) => { if(p.gen){ p.resolve({ dropped:true }); this.pending.delete(id); } });
     this.srcs.forEach(s => { try{ s.stop(); }catch(e){} });
-    this.srcs = []; this.tl = []; this.queue = []; this.carry = []; this.lastI = -1; this.lastW = -1;
+    this.inflight.forEach((e, k) => { if(e.gen) this.inflight.delete(k); });
+    this.srcs = []; this.tl = []; this.queue = []; this.cur = null; this.lastI = -1; this.lastW = -1;
     clearInterval(this.ticker); this.ticker = null;
     if(this.a){ this.internalAt = Date.now(); this.a.pause(); }
   },
@@ -641,38 +732,21 @@ const Natural = {
     }, 150);
   },
   runTicker(){ clearInterval(this.ticker); this.ticker = setInterval(() => this.tick(), 90); },
-  segment(){
-    const lim = [0, 110, 260, 600][Math.min(this.made++, 3)];
-    const units = []; let chars = 0;
-    for(;;){
-      if(!this.carry.length){
-        if(this.next >= R.flat.length) break;
-        this.carry = this.unitsOf(this.next++, false);
-      }
-      const u = this.carry[0];
-      if(units.length && (chars + u.text.length > lim || units.length >= 14)) break;
-      units.push(this.carry.shift()); chars += u.text.length;
-      if(lim === 0) break;
-    }
-    return { units };
-  },
   fill(gen){
-    const max = document.hidden ? 8 : 4;
-    while(this.queue.length < max && (this.carry.length || this.next < R.flat.length)){
-      const seg = this.segment(); seg.done = false;
-      const keys = seg.units.map(u => this.ckey(u.text));
-      const res = keys.map(k => this.cget(k));
-      const miss = res.map((v, k) => v ? -1 : k).filter(k => k >= 0);
-      const p = miss.length
-        ? this.send({ type:'synth', gen, voice:this.voice(), texts:miss.map(k => seg.units[k].text), rate:S.rate })
-        : Promise.resolve({});
-      seg.p = p.then(r => {
-        if(r.dropped || r.error) return r;
-        miss.forEach((k, j) => { const v = { pcm:r.pcm[j], sr:r.sr, phon:r.phon && r.phon[j] }; res[k] = v; this.cput(keys[k], v); });
-        seg.res = res; return { ok:true };
-      });
+    const maxChars = document.hidden ? 2500 : 1200;
+    let pend = this.queue.reduce((a, q) => a + (q.done ? 0 : q.units[0].text.length), 0);
+    while(this.queue.length < 40 && pend < maxChars){
+      const u = this.cur && this.cur.take(); if(!u) break;
+      const prio = this.firsts > 0; this.firsts--;
+      const seg = { units:[u], done:false };
+      const got = v => {
+        if(v && v.dropped && gen === this.gen) return this.audioFor(u.text, gen, prio).then(got);
+        if(!v || v.dropped || v.error) return v || { dropped:true };
+        seg.res = [v]; return { ok:true };
+      };
+      seg.p = this.audioFor(u.text, gen, prio).then(got);
       seg.p.then(() => { seg.done = true; });
-      this.queue.push(seg);
+      this.queue.push(seg); pend += u.text.length;
     }
   },
   async pump(gen){
@@ -695,7 +769,7 @@ const Natural = {
         this.schedule(seg);
         continue;
       }
-      if(!this.queue.length && !this.carry.length && this.next >= R.flat.length && now > this.endTime){
+      if(!this.queue.length && (!this.cur || this.cur.done) && now > this.endTime){
         this.stop(); this.h.onEnd(); return;
       }
       await sleep(200);
@@ -707,11 +781,10 @@ const Natural = {
     seg.units.forEach((u, k) => {
       const v = seg.res[k]; if(!v) return;
       const sr = v.sr; let pc = v.pcm;
-      // Dentro de una frase partida se recortan los silencios de los bordes para que no se note el corte
-      if(pc.length && (!u.first || !u.last)){
+      // Se recortan los silencios de los bordes y se ponen pausas uniformes: coma, frase y párrafo
+      if(pc.length){
         const [va, vb] = voicedRange(pc, sr);
-        const a = u.first ? 0 : Math.max(0, Math.floor((va - 0.03) * sr));
-        const b = u.last ? pc.length : Math.min(pc.length, Math.ceil((vb + 0.06) * sr));
+        const a = Math.max(0, Math.floor((va - 0.03) * sr)), b = Math.min(pc.length, Math.ceil((vb + 0.07) * sr));
         if(b > a) pc = pc.subarray(a, b);
       }
       if(pc.length){
@@ -721,7 +794,9 @@ const Natural = {
         this.srcs.push(s);
       }
       this.tl.push({ i:u.i, wOff:u.wOff, t0:this.endTime, words:wordTimes(u.text, v.phon, pc, sr) });
-      this.endTime += pc.length / sr + (u.last ? (R.pend.has(u.i) ? 0.6 : 0.24) : (/[,;:]$/.test(u.text) ? 0.12 : 0.02));
+      const r = Math.max(0.6, S.rate);
+      const gap = u.last ? (R.pend.has(u.i) ? 0.65 : 0.38) : (/[,;:)]$/.test(u.text) ? 0.2 : 0.04);
+      this.endTime += pc.length / sr + gap / r;
     });
   },
   tick(){
@@ -1052,6 +1127,7 @@ async function openDoc(id){
   $('#library').hidden = true; $('#reader').hidden = false;
   R.idx = Math.min(meta.pos || 0, R.flat.length - 1);
   mark(R.idx, true);
+  Natural.warm(R.idx);
   meta.opened = Date.now(); DB.putMeta(meta);
   ui();
 }
@@ -1144,7 +1220,7 @@ function jump(i){
   if(!R.flat.length) return;
   i = Math.max(0, Math.min(R.flat.length - 1, i));
   R.idx = i; R.ended = false; mark(i, true); savePos();
-  if(R.playing) engine().start(i, handlers); else stopAll();
+  if(R.playing) engine().start(i, handlers); else { stopAll(); Natural.warm(i); }
 }
 function ui(){
   $('#ico-play').hidden = R.playing; $('#ico-pause').hidden = !R.playing;
@@ -1360,6 +1436,17 @@ document.querySelectorAll('dialog.sheet').forEach(d => {
 });
 if('speechSynthesis' in window) speechSynthesis.addEventListener('voiceschanged', () => { if($('#sheet-settings').open && S.engine === 'system') fillVoices(); });
 window.addEventListener('pagehide', () => savePos(true));
+
+/* Vigilancia: el botón y el audio siempre coinciden. Si el móvil pausa o reanuda el sonido
+   por su cuenta, se corrige al momento. */
+setInterval(() => {
+  if(S.engine !== 'natural' || !Natural.ctx) return;
+  const st = Natural.ctx.state;
+  if(!R.playing && st === 'running' && Natural.srcs.length && !Natural.paused){ Natural.pause(); media(); }
+  else if(R.playing && st === 'suspended' && !Natural.paused){ Natural.ctx.resume().catch(() => {}); }
+  const icon = !$('#ico-pause').hidden;
+  if(icon !== R.playing) ui();
+}, 1000);
 
 /* ---------- App instalable ---------- */
 let installEvt = null;
