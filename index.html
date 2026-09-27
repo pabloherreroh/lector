@@ -217,7 +217,7 @@ dialog.sheet::backdrop{background:rgba(8,12,20,.45)}
     </div>
   </div>
   <button class="btn primary" style="width:100%" data-close>Listo</button>
-  <p class="hint" style="text-align:center;margin-top:12px">Versión 11</p>
+  <p class="hint" style="text-align:center;margin-top:12px">Versión 14</p>
 </dialog>
 
 <!-- PEGAR TEXTO -->
@@ -342,7 +342,59 @@ function workerMain(){
   const ORT = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/';
   const PH  = 'https://cdn.jsdelivr.net/npm/@diffusionstudio/piper-wasm@1.0.0/build/piper_phonemize';
   const HF  = ['https://huggingface.co/rhasspy/piper-voices/resolve/main/', 'https://huggingface.co/diffusionstudio/piper-voices/resolve/main/'];
-  let libs = false, phon = null, session = null, cfg = null, loaded = null, minGen = 0, busy = false;
+  let libs = false, phon = null, session = null, cfg = null, loaded = null, minGen = 0, busy = false, durName = null;
+  /* Añade como salida del modelo ONNX el tensor de duraciones (salida del nodo Ceil),
+     editando el protobuf directamente. Devuelve { bytes, name } o null si no se puede. */
+  function addDurationsOutput(u8){
+    const rv = (b, p) => { let v = 0, m = 1, c; do { c = b[p++]; v += (c & 127) * m; m *= 128; } while(c & 128); return [v, p]; };
+    const enc = n => { const o = []; do { let c = n % 128; n = Math.floor(n / 128); if(n) c |= 128; o.push(c); } while(n); return o; };
+    const skip = (b, p, w) => { if(w === 0){ return rv(b, p)[1]; } if(w === 1) return p + 8; if(w === 5) return p + 4; if(w === 2){ const [l, q] = rv(b, p); return q + l; } throw new Error('wire ' + w); };
+    const str = (b, s, e) => new TextDecoder().decode(b.subarray(s, e));
+    // 1) localizar el grafo (campo 7) en ModelProto
+    let p = 0, gTag = -1, gStart = -1, gEnd = -1;
+    while(p < u8.length){
+      const t0 = p; const [tag, q] = rv(u8, p); const f = Math.floor(tag / 8), w = tag & 7;
+      if(f === 7 && w === 2){ const [l, r] = rv(u8, q); gTag = t0; gStart = r; gEnd = r + l; p = gEnd; }
+      else p = skip(u8, q, w);
+    }
+    if(gStart < 0) return null;
+    // 2) recorrer el grafo: nodos Ceil y salidas existentes
+    const ceils = [], outs = [];
+    p = gStart;
+    while(p < gEnd){
+      const [tag, q] = rv(u8, p); const f = Math.floor(tag / 8), w = tag & 7;
+      if(w === 2 && (f === 1 || f === 12)){
+        const [l, s] = rv(u8, q); const e = s + l;
+        let op = '', o = [], name = '', r = s;
+        while(r < e){
+          const [tg, r2] = rv(u8, r); const ff = Math.floor(tg / 8), ww = tg & 7;
+          if(ww === 2){ const [ll, rs] = rv(u8, r2); const v = str(u8, rs, rs + ll);
+            if(f === 1 && ff === 4) op = v; if(f === 1 && ff === 2) o.push(v); if(f === 12 && ff === 1) name = v; r = rs + ll; }
+          else r = skip(u8, r2, ww);
+        }
+        if(f === 1 && op === 'Ceil') ceils.push(...o);
+        if(f === 12) outs.push(name);
+        p = e;
+      } else p = skip(u8, q, w);
+    }
+    if(ceils.length !== 1) return null;
+    const name = ceils[0];
+    if(outs.includes(name)) return { bytes:u8, name };
+    // 3) añadir ValueInfoProto { name } como salida (campo 12) al final del grafo
+    const nb = new TextEncoder().encode(name);
+    const vi = [0x0a, ...enc(nb.length), ...nb];
+    const entry = Uint8Array.from([0x62, ...enc(vi.length), ...vi]);
+    const newLen = (gEnd - gStart) + entry.length;
+    const head = Uint8Array.from([...u8.subarray(gTag, gTag + 1), ...enc(newLen)]);   // etiqueta del campo 7 (1 byte: 0x3a)
+    const out = new Uint8Array(gTag + head.length + newLen + (u8.length - gEnd));
+    let k = 0;
+    out.set(u8.subarray(0, gTag), k); k += gTag;
+    out.set(head, k); k += head.length;
+    out.set(u8.subarray(gStart, gEnd), k); k += gEnd - gStart;
+    out.set(entry, k); k += entry.length;
+    out.set(u8.subarray(gEnd), k);
+    return { bytes:out, name };
+  }
   const lines = [], jobs = [];
   const post = (m, t) => self.postMessage(m, t || []);
 
@@ -392,7 +444,17 @@ function workerMain(){
       const js = await fetchCached(keyBase + voice.model + '.json', bases.map(b => b + voice.model + '.json'), null, id);
       cfg = JSON.parse(new TextDecoder().decode(js));
       const buf = await fetchCached(keyBase + voice.model, bases.map(b => b + voice.model), 'Descargando la voz', id);
-      session = await ort.InferenceSession.create(new Uint8Array(buf), { executionProviders:['wasm'], graphOptimizationLevel:'all' });
+      // Se pide también la duración de cada fonema: así se sabe dónde empieza y acaba de verdad la voz
+      let bytes = new Uint8Array(buf), pt = null;
+      try{ pt = addDurationsOutput(bytes); }catch(e){ pt = null; }
+      try{
+        session = await ort.InferenceSession.create(pt ? pt.bytes : bytes, { executionProviders:['wasm'], graphOptimizationLevel:'all' });
+        durName = pt ? pt.name : null;
+      }catch(e){
+        if(!pt) throw e;
+        session = await ort.InferenceSession.create(bytes, { executionProviders:['wasm'], graphOptimizationLevel:'all' });
+        durName = null;
+      }
       loaded = voice.model;
     }
   }
@@ -408,11 +470,11 @@ function workerMain(){
     const inf = cfg.inference || {};
     const scales = Float32Array.from([inf.noise_scale ?? 0.667, (inf.length_scale ?? 1) / Math.min(2, Math.max(0.5, job.rate || 1)), inf.noise_w ?? 0.8]);
     const sid = cfg.num_speakers > 1 ? ((cfg.speaker_id_map || {})[job.voice.speaker] ?? 0) : null;
-    const pcm = [];
+    const pcm = [], edges = [];
     for(const r of ph){
       await yieldNow();
       if(job.gen && job.gen < minGen) return null;
-      if(!r.phonemes || !r.phonemes.length || !r.phoneme_ids || !r.phoneme_ids.length){ pcm.push(new Float32Array(0)); continue; }
+      if(!r.phonemes || !r.phonemes.length || !r.phoneme_ids || !r.phoneme_ids.length){ pcm.push(new Float32Array(0)); edges.push(null); continue; }
       const ids = BigInt64Array.from(r.phoneme_ids, v => BigInt(v));
       const feeds = {
         input:new ort.Tensor('int64', ids, [1, ids.length]),
@@ -422,8 +484,11 @@ function workerMain(){
       if(sid !== null) feeds.sid = new ort.Tensor('int64', BigInt64Array.from([BigInt(sid)]), [1]);
       const out = await session.run(feeds);
       pcm.push(new Float32Array(out.output.data));
+      // Muestras de silencio inicial (inicio + primera pausa) y final (fin), según la propia voz
+      const d = durName && out[durName] ? out[durName].data : null;
+      edges.push(d && d.length > 2 ? [(d[0] + d[1]) * 256, d[d.length - 1] * 256] : null);
     }
-    return { pcm, sr:cfg.audio.sample_rate, phon:ph.map(x => x.phonemes || []) };
+    return { pcm, edges, sr:cfg.audio.sample_rate, phon:ph.map(x => x.phonemes || []) };
   }
   /* Cede el turno para que lleguen los mensajes nuevos (pausa, salto) aunque haya trabajo en cola */
   const yieldNow = () => new Promise(r => { const c = new MessageChannel(); c.port1.onmessage = () => r(); c.port2.postMessage(0); });
@@ -437,7 +502,7 @@ function workerMain(){
         if(job.type === 'prepare'){ await ensure(job.voice, job.id); post({ type:'ready', id:job.id, voiceId:job.voice.id }); }
         else{
           const r = await synth(job);
-          if(r) post({ type:'audio', id:job.id, voiceId:job.voice.id, pcm:r.pcm, sr:r.sr, phon:r.phon }, r.pcm.map(a => a.buffer));
+          if(r) post({ type:'audio', id:job.id, voiceId:job.voice.id, pcm:r.pcm, edges:r.edges, sr:r.sr, phon:r.phon }, r.pcm.map(a => a.buffer));
           else post({ type:'dropped', id:job.id });
         }
       }catch(e){ post({ type:'error', id:job.id, message:String((e && e.message) || e) }); }
@@ -480,7 +545,21 @@ function friendly(msg){
 }
 
 /* Tiempos estimados de cada palabra dentro de una frase, a partir de sus fonemas */
-/* Parte un texto largo en trozos de como mucho "max" caracteres, preferiblemente tras una coma */
+/* Texto tal como debe sonar: sin viñetas, símbolos, ligaduras raras ni llamadas de nota.
+   Solo cambia lo que se envía a la voz; en pantalla el texto sigue igual. */
+function speakable(t){
+  return t
+    .replace(/[\uE000-\uF8FF]/g, ' ')                                  // símbolos privados de Word/PDF (viñetas)
+    .replace(/(\d)\s*(mm|cm|m|km|ha)([²³])?(?![\p{L}\d])/gu, (m, d, u, e) =>                // unidades tras un número
+      d + ' ' + { mm:'milímetros', cm:'centímetros', m:'metros', km:'kilómetros', ha:'hectáreas' }[u] + (e ? (e === '²' ? ' cuadrados' : ' cúbicos') : ''))
+    .replace(/\b(mm|cm|dm|m|km|hm)([²³])/g, (m, u, e) => u + (e === '²' ? ' cuadrados' : ' cúbicos'))
+    .replace(/([\p{L}\p{P}])[¹²³⁴⁵⁶⁷⁸⁹⁰]+/gu, '$1')                     // llamadas de nota: nota¹
+    .replace(/\s*\[\d+(?:\s*[,–-]\s*\d+)*\]/g, '')                        // referencias [3], [4-6]
+    .replace(/[\uFB00-\uFB06]/g, c => ({ '\uFB00':'ff', '\uFB01':'fi', '\uFB02':'fl', '\uFB03':'ffi', '\uFB04':'ffl', '\uFB05':'st', '\uFB06':'st' })[c])  // ligaduras de PDF
+    .replace(/[\u2022\u2023\u2043\u25A0-\u25FF\u2190-\u21FF\u2600-\u27BF\u2B00-\u2BFF\u{1F300}-\u{1FAFF}\u00B7*#_|~^`]/gu, ' ')
+    .replace(/^\s*[-–—]\s+/, '')                                          // guion de lista al principio
+    .replace(/\s+/g, ' ').trim();
+}
 /* Parte un texto largo en trozos de como mucho "max" caracteres, SOLO donde hay una pausa real
    (coma, punto y coma, dos puntos, paréntesis). Cortar entre palabras sueltas rompe la entonación.
    Solo con anyGap se permite cortar en un espacio (último recurso para párrafos sin puntuación). */
@@ -513,21 +592,48 @@ function firstClause(text){
 }
 function tokens(text){ const out = []; const re = /\S+/g; let m; while((m = re.exec(text))) out.push({ w:m[0], s:m.index, e:m.index + m[0].length }); return out; }
 function voicedRange(pc, sr){
-  const fr = Math.max(1, Math.round(sr * 0.01)), n = Math.floor(pc.length / fr); if(!n) return [0, pc.length / sr];
-  const rms = new Float32Array(n); let mx = 0;
-  for(let f = 0; f < n; f++){ let s = 0; for(let j = f * fr; j < (f + 1) * fr; j++) s += pc[j] * pc[j]; rms[f] = Math.sqrt(s / fr); if(rms[f] > mx) mx = rms[f]; }
-  // La voz empieza donde hay 4 tramos seguidos (40 ms) con sonido: así se ignoran golpes sueltos
-  const th = Math.max(0.005, mx * 0.08), K = 4; let a = 0, b = n - 1;
-  const on = (f, dir) => { for(let k = 0; k < K; k++){ const g = f + k * dir; if(g < 0 || g >= n || rms[g] < th) return false; } return true; };
-  while(a < n && !on(a, 1)) a++;
-  while(b > a && !on(b, -1)) b--;
-  if(a >= n || b <= a){ a = 0; b = n - 1; }
+  // Tramos de 5 ms. "Sonido" = por encima de -50 dB (umbral absoluto: no se come consonantes suaves como f, s o c).
+  const fr = Math.max(1, Math.round(sr * 0.005)), n = Math.floor(pc.length / fr); if(!n) return [0, pc.length / sr];
+  const act = new Uint8Array(n);
+  for(let f = 0; f < n; f++){ let s = 0; for(let j = f * fr; j < (f + 1) * fr; j++) s += pc[j] * pc[j]; act[f] = Math.sqrt(s / fr) > 0.003 ? 1 : 0; }
+  // Un golpe suelto no cuenta: debe haber al menos 60 ms de sonido en los 150 ms siguientes (o anteriores)
+  const win = Math.round(0.15 / 0.005), need = Math.round(0.06 / 0.005);
+  const real = (f, dir) => { let c = 0; for(let k = 0; k < win; k++){ const g = f + k * dir; if(g < 0 || g >= n) break; c += act[g]; } return act[f] && c >= need; };
+  let a = 0, b = n - 1;
+  while(a < n && !real(a, 1)) a++;
+  while(b > a && !real(b, -1)) b--;
+  if(a >= n || b <= a) return [0, pc.length / sr];
   return [a * fr / sr, (b + 1) * fr / sr];
+}
+/* Bordes del trozo a partir de los límites que da la voz: desde ahí se retrocede (o avanza) mientras
+   siga habiendo voz, sin cruzar un silencio. Así entra el principio entero de una "l" o una "m", y el
+   golpe de aire que a veces precede a la frase, separado por un silencio, queda fuera. */
+function edgeTrim(pc, sr, lead, tail){
+  const hop = Math.max(1, Math.round(sr * 0.005)), win = Math.round(sr * 0.02), cap = Math.round(0.25 * sr);
+  // Volumen en ventanas de 20 ms (más de dos ciclos de la voz, para que no oscile)
+  const lv = (i) => { const s0 = Math.max(0, i - (win >> 1)), s1 = Math.min(pc.length, s0 + win); let s = 0; for(let j = s0; j < s1; j++) s += pc[j] * pc[j]; return 10 * Math.log10(s / Math.max(1, s1 - s0) + 1e-12); };
+  // Se retrocede mientras haya voz (> -55 dB). Si antes aparece un valle claro (< -40 dB) y el volumen
+  // vuelve a subir detrás (golpe de aire pegado a la voz), se para en el valle.
+  const walk = (start, dir) => {
+    let p = start, lo = lv(p), at = p;
+    while(true){
+      const q = p + dir * hop; if(q < 0 || q > pc.length || Math.abs(q - start) > cap) break;
+      const l = lv(q);
+      if(l < -55){ at = q; break; }
+      if(lo < -40 && l > lo + 6) break;
+      if(l < lo){ lo = l; at = q; }
+      p = q; if(lo >= -40) at = q;
+    }
+    return at;
+  };
+  const a = walk(Math.max(0, Math.min(pc.length, Math.round(lead))), -1);
+  const b = walk(Math.max(a + hop, Math.min(pc.length, Math.round(pc.length - tail))), 1);
+  return [Math.max(0, a - Math.round(0.015 * sr)), Math.min(pc.length, b + Math.round(0.03 * sr))];
 }
 /* Copia del trozo con entrada y salida suaves: evita el chasquido de cortar el audio en seco */
 function faded(pc, sr){
   const out = new Float32Array(pc);
-  const fi = Math.min(out.length >> 2, Math.round(sr * 0.012)), fo = Math.min(out.length >> 2, Math.round(sr * 0.025));
+  const fi = Math.min(out.length >> 2, Math.round(sr * 0.008)), fo = Math.min(out.length >> 2, Math.round(sr * 0.02));
   for(let i = 0; i < fi; i++) out[i] *= 0.5 - 0.5 * Math.cos(Math.PI * i / fi);
   for(let i = 0; i < fo; i++) out[out.length - 1 - i] *= 0.5 - 0.5 * Math.cos(Math.PI * i / fo);
   return out;
@@ -621,7 +727,7 @@ const Natural = {
     }
     const p = this.pending.get(m.id); if(!p) return;
     this.pending.delete(m.id);
-    if(m.type === 'audio') p.resolve({ pcm:m.pcm, sr:m.sr, phon:m.phon });
+    if(m.type === 'audio') p.resolve({ pcm:m.pcm, edges:m.edges, sr:m.sr, phon:m.phon });
     else if(m.type === 'ready') p.resolve({ ok:true });
     else if(m.type === 'error') p.resolve({ error:friendly(m.message) });
     else p.resolve({ dropped:true });
@@ -712,10 +818,10 @@ const Natural = {
     if(hit) return Promise.resolve(hit);
     const fl = this.inflight.get(key);
     if(fl && (fl.gen === 0 || fl.gen === this.gen)) return fl.p;
-    const p = this.send({ type:'synth', gen, voice:this.voice(), texts:[text], rate:S.rate, prio:!!prio }).then(r => {
+    const p = this.send({ type:'synth', gen, voice:this.voice(), texts:[speakable(text) || '.'], rate:S.rate, prio:!!prio }).then(r => {
       if(this.inflight.get(key) === entry) this.inflight.delete(key);
       if(r.dropped || r.error) return r;
-      const v = { pcm:r.pcm[0], sr:r.sr, phon:r.phon && r.phon[0] };
+      const v = { pcm:r.pcm[0], edges:r.edges && r.edges[0], sr:r.sr, phon:r.phon && r.phon[0] };
       this.cput(key, v); return v;
     });
     const entry = { p, gen };
@@ -816,9 +922,13 @@ const Natural = {
       const v = seg.res[k]; if(!v) return;
       const sr = v.sr; let pc = v.pcm;
       // Se recortan los silencios de los bordes y se ponen pausas uniformes: coma, frase y párrafo
-      if(pc.length){
+      if(pc.length && v.edges){
+        // La voz dice dónde empieza y acaba: se quita el arranque (donde a veces hay un golpe de aire)
+        const [a, b] = edgeTrim(pc, sr, v.edges[0], v.edges[1]);
+        if(b > a) pc = pc.subarray(a, b);
+      } else if(pc.length){
         const [va, vb] = voicedRange(pc, sr);
-        const a = Math.max(0, Math.floor((va - 0.04) * sr)), b = Math.min(pc.length, Math.ceil((vb + 0.09) * sr));
+        const a = Math.max(0, Math.floor((va - 0.02) * sr)), b = Math.min(pc.length, Math.ceil((vb + 0.05) * sr));
         if(b > a) pc = pc.subarray(a, b);
       }
       if(pc.length){
