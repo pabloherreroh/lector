@@ -217,7 +217,7 @@ dialog.sheet::backdrop{background:rgba(8,12,20,.45)}
     </div>
   </div>
   <button class="btn primary" style="width:100%" data-close>Listo</button>
-  <p class="hint" style="text-align:center;margin-top:12px">Versión 8</p>
+  <p class="hint" style="text-align:center;margin-top:12px">Versión 10</p>
 </dialog>
 
 <!-- PEGAR TEXTO -->
@@ -481,21 +481,35 @@ function friendly(msg){
 
 /* Tiempos estimados de cada palabra dentro de una frase, a partir de sus fonemas */
 /* Parte un texto largo en trozos de como mucho "max" caracteres, preferiblemente tras una coma */
-function splitText(text, max){
+/* Parte un texto largo en trozos de como mucho "max" caracteres, SOLO donde hay una pausa real
+   (coma, punto y coma, dos puntos, paréntesis). Cortar entre palabras sueltas rompe la entonación.
+   Solo con anyGap se permite cortar en un espacio (último recurso para párrafos sin puntuación). */
+function splitText(text, max, anyGap){
   const out = []; let s = 0;
   while(text.length - s > max){
     const chunk = text.slice(s, s + max + 1);
     let cut = -1; const re = /[,;:)](?=\s)/g; let m;
-    const minCut = Math.max(8, Math.floor(max * 0.4));
+    const minCut = Math.max(8, Math.floor(max * 0.3));
     while((m = re.exec(chunk))){ if(m.index >= minCut) cut = m.index + 1; }
-    if(cut < 0){ const k = chunk.lastIndexOf(' '); if(k > minCut) cut = k; }
+    if(cut < 0 && anyGap){ const k = chunk.lastIndexOf(' '); if(k > minCut) cut = k; }
     if(cut < 0) break;
     let n = s + cut; while(n < text.length && /\s/.test(text[n])) n++;
-    if(text.length - n < Math.min(12, max / 2)) break;
+    if(text.length - n < 12) break;
     out.push({ s, e:n }); s = n;
   }
   out.push({ s, e:text.length });
   return out.map(p => ({ text:text.slice(p.s, p.e).trim(), s:p.s }));
+}
+/* Primera pausa natural (coma, punto y coma, dos puntos) de una frase, para arrancar antes sin romperla */
+function firstClause(text){
+  const re = /[,;:](?=\s)/g; let m;
+  while((m = re.exec(text))){
+    if(m.index < 12) continue;
+    if(m.index > 120) break;
+    let n = m.index + 1; while(n < text.length && /\s/.test(text[n])) n++;
+    return text.length - n >= 15 ? n : -1;
+  }
+  return -1;
 }
 function tokens(text){ const out = []; const re = /\S+/g; let m; while((m = re.exec(text))) out.push({ w:m[0], s:m.index, e:m.index + m[0].length }); return out; }
 function voicedRange(pc, sr){
@@ -645,26 +659,34 @@ const Natural = {
      es corta a propósito. */
   unitsOf(i){
     const text = R.flat[i];
-    const parts = splitText(text, 100);
+    // La frase se genera entera. Solo las muy largas se parten, y siempre por una pausa real.
+    let parts = [{ text, s:0 }];
+    if(text.length > 140 && !(/[¿?¡!]/.test(text) && text.length <= 260)){
+      parts = splitText(text, 120, false);
+      parts = parts.flatMap(p => p.text.length > 320 ? splitText(p.text, 220, true).map(q => ({ text:q.text, s:p.s + q.s })) : [p]);
+    }
     return parts.map((p, k) => ({ i, text:p.text, wOff:tokens(text.slice(0, p.s)).length, first:k === 0, last:k === parts.length - 1 }));
   },
   cursor(from){
     const self = this;
     return {
-      carry:[], next:from, maxLen:18,
+      carry:[], next:from, fast:true,
       take(){
         if(!this.carry.length){
           if(this.next >= R.flat.length) return null;
           this.carry = self.unitsOf(this.next++);
         }
         let u = this.carry.shift();
-        if(u.text.length > this.maxLen * 1.3 && !self.cache.has(self.ckey(u.text))){
-          const parts = splitText(u.text, this.maxLen);
-          const pieces = parts.map((p, k) => ({ i:u.i, text:p.text, wOff:u.wOff + tokens(u.text.slice(0, p.s)).length,
-            first:u.first && k === 0, last:u.last && k === parts.length - 1 }));
-          u = pieces.shift(); this.carry = pieces.concat(this.carry);
+        // Solo el primer trozo tras pulsar reproducir o saltar se adelanta hasta la primera coma
+        if(this.fast && u.text.length > 70 && !/[¿?¡!]/.test(u.text) && !self.cache.has(self.ckey(u.text))){
+          const n = firstClause(u.text);
+          if(n > 0){
+            const a = { i:u.i, text:u.text.slice(0, n).trim(), wOff:u.wOff, first:u.first, last:false };
+            const b = { i:u.i, text:u.text.slice(n).trim(), wOff:u.wOff + tokens(u.text.slice(0, n)).length, first:false, last:u.last };
+            this.carry.unshift(b); u = a;
+          }
         }
-        this.maxLen = Math.min(100, Math.round(this.maxLen * 1.35));
+        this.fast = false;
         return u;
       },
       get done(){ return !this.carry.length && this.next >= R.flat.length; }
