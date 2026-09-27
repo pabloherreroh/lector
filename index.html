@@ -217,7 +217,7 @@ dialog.sheet::backdrop{background:rgba(8,12,20,.45)}
     </div>
   </div>
   <button class="btn primary" style="width:100%" data-close>Listo</button>
-  <p class="hint" style="text-align:center;margin-top:12px">Versión 7</p>
+  <p class="hint" style="text-align:center;margin-top:12px">Versión 8</p>
 </dialog>
 
 <!-- PEGAR TEXTO -->
@@ -1223,7 +1223,8 @@ function jump(i){
   if(R.playing) engine().start(i, handlers); else { stopAll(); Natural.warm(i); }
 }
 function ui(){
-  $('#ico-play').hidden = R.playing; $('#ico-pause').hidden = !R.playing;
+  // Los iconos son SVG: se ocultan con el atributo, no con la propiedad .hidden (que en SVG no existe)
+  $('#ico-play').toggleAttribute('hidden', R.playing); $('#ico-pause').toggleAttribute('hidden', !R.playing);
   $('#btn-play').setAttribute('aria-label', R.playing ? 'Pausar' : 'Reproducir');
   $('#btn-rate').textContent = S.rate.toFixed(Math.round(S.rate * 100) % 10 ? 2 : 1).replace('.', ',') + '×';
 }
@@ -1444,7 +1445,7 @@ setInterval(() => {
   const st = Natural.ctx.state;
   if(!R.playing && st === 'running' && Natural.srcs.length && !Natural.paused){ Natural.pause(); media(); }
   else if(R.playing && st === 'suspended' && !Natural.paused){ Natural.ctx.resume().catch(() => {}); }
-  const icon = !$('#ico-pause').hidden;
+  const icon = !$('#ico-pause').hasAttribute('hidden');
   if(icon !== R.playing) ui();
 }, 1000);
 
