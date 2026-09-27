@@ -23,7 +23,8 @@ self.addEventListener('fetch', e => {
   // La app: primero la red (para recibir actualizaciones), si no hay conexión, la copia guardada
   if(url.origin === self.location.origin){
     e.respondWith(
-      fetch(req).then(res => {
+      // no-cache: pregunta siempre al servidor si hay versión nueva (GitHub guarda copias 10 minutos)
+      fetch(req, { cache:'no-cache' }).then(res => {
         if(res.ok){ const copy = res.clone(); caches.open(VERSION).then(c => c.put(req, copy)); }
         return res;
       }).catch(() => caches.match(req, { ignoreSearch:true }).then(r => r || caches.match('./index.html')))
